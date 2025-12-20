@@ -53,15 +53,13 @@ class PipelineConfig:
     conf_doc: float = 0.35
     conf_stamp: float = 0.25
     
-    # --- NEW TUNING PARAMETERS ---
-    # 1. Blank Page Fix: Darkest pixel threshold
-    # If the darkest 1% of pixels are brighter than this (0=Black, 255=White), it's blank/bleed-through.
+    # Tuning Parameters
     dark_pixel_threshold: int = 140  
     
-    # 2. Text-As-Image Fix: Contour counting
-    # If a detected "Image" has more than this many small blobs, it's actually Text.
-    max_text_contours: int = 25      
-    
+    # --- GHOST IMAGE TUNING ---
+    max_text_contours: int = 15  
+    max_avg_contour_area: int = 1500
+
     # Class Definitions
     keep_classes: Tuple[str, ...] = ("text", "title", "figure", "table", "list", "image", "heading")
     image_classes: Tuple[str, ...] = ("figure", "image", "picture", "photo")
@@ -88,41 +86,40 @@ def intersect(box: List[int], w: int, h: int) -> Tuple[int, int, int, int]:
     return (max(0, min(int(x1), w)), max(0, min(int(y1), h)), 
             max(0, min(int(x2), w)), max(0, min(int(y2), h)))
 
-# --- NEW VALIDATOR: Checks for "Dark Ink" ---
 def has_true_dark_content(crop_bgr: np.ndarray, threshold: int) -> bool:
-    """
-    Returns True if the region contains pixels dark enough to be real ink/photo shadows.
-    Filters out bleed-through which is usually light gray.
-    """
     if crop_bgr.size == 0: return False
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Get the intensity of the darkest 1% of pixels
-    # If this value is high (e.g., 180), the "darkest" thing in the box is light gray.
     darkest_percentile = np.percentile(gray, 1)
-    
     return darkest_percentile < threshold
 
-# --- NEW VALIDATOR: Checks if "Image" is actually Text ---
-def is_actually_text_block(crop_bgr: np.ndarray, min_contours: int) -> bool:
-    """
-    Returns True if the region looks like a block of text (many small blobs),
-    even if the AI detected it as an image.
-    """
+# --- GHOST IMAGE CLASSIFIER ---
+def is_actually_text_contour(crop_bgr: np.ndarray, config: PipelineConfig) -> bool:
     if crop_bgr.size == 0: return False
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     
-    # Binarize (Otsu)
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    total_box_area = h * w
+    
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Count Contours (Blobs)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 20]
+    num_blobs = len(valid_contours)
     
-    # Filter tiny noise
-    valid_contours = [c for c in contours if cv2.contourArea(c) > 5]
+    if num_blobs == 0: return False
     
-    # If we have 25+ distinct letters/shapes, it's text, not a single photo.
-    return len(valid_contours) > min_contours
+    ink_area = sum(cv2.contourArea(c) for c in valid_contours)
+    fill_ratio = ink_area / total_box_area
+    avg_blob_area = ink_area / num_blobs
+    
+    if num_blobs > 20 and avg_blob_area < 800:
+        return True
+        
+    if 3 <= num_blobs <= 30:
+        if fill_ratio < 0.45: 
+            return True
+            
+    return False
 
 
 # ==============================================================================
@@ -130,13 +127,8 @@ def is_actually_text_block(crop_bgr: np.ndarray, min_contours: int) -> bool:
 # ==============================================================================
 
 def get_page_analysis(img: np.ndarray, model: Any, config: PipelineConfig):
-    """
-    Returns:
-    1. is_blank (bool): True if no REAL content found.
-    2. image_boxes (list): Validated images to preserve in color.
-    """
     is_blank = True
-    image_boxes = []
+    preserve_color_boxes = [] 
     h, w = img.shape[:2]
     
     try:
@@ -153,31 +145,24 @@ def get_page_analysis(img: np.ndarray, model: Any, config: PipelineConfig):
                 x1, y1, x2, y2 = intersect(box, w, h)
                 crop = img[y1:y2, x1:x2]
                 
-                # --- FIX 1: BLANK PAGE / BLEED THROUGH ---
-                # Check if the content is "dark enough" to be real.
                 if not has_true_dark_content(crop, config.dark_pixel_threshold):
-                    # It's just faint bleed-through or paper texture. Ignore it.
                     continue
                 
-                # If we pass the dark check, the page is NOT blank.
                 is_blank = False
                 
-                # --- FIX 2: TEXT MISCLASSIFIED AS IMAGE ---
-                # Only add to "Preserve Color" list if it is an Image class AND NOT text.
+                final_is_image = is_img_class
                 if is_img_class:
-                    if is_actually_text_block(crop, config.max_text_contours):
-                        # It detected an image, but it's full of letters.
-                        # Treat as TEXT -> Do not preserve color -> Convert to Grayscale.
-                        pass 
-                    else:
-                        # It's a real photo/diagram. Keep color.
-                        image_boxes.append(box)
-                        
+                    if is_actually_text_contour(crop, config):
+                        final_is_image = False 
+
+                if final_is_image:
+                    preserve_color_boxes.append(box)
+                    
     except Exception as e:
         print(f"Warning in analysis: {e}")
         pass
         
-    return is_blank, image_boxes
+    return is_blank, preserve_color_boxes
 
 
 # ==============================================================================
@@ -195,34 +180,6 @@ def load_models(config: PipelineConfig):
     stamp_model = YOLO(config.model_stamp_path)
     return doc_model, stamp_model
 
-def process_stamps(img: np.ndarray, model: Any, config: PipelineConfig) -> np.ndarray:
-    # Detect stamps -> Clean them -> Paste back (still in color/BGR)
-    h, w = img.shape[:2]
-    try: results = model.predict(img, conf=config.conf_stamp, imgsz=640, verbose=False)[0]
-    except: return img
-    
-    processed_img = img.copy()
-    
-    # Helper to clean stamp crop
-    def clean_crop(c):
-        gray = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
-        w_size = config.sauvola_window | 1
-        thresh = threshold_sauvola(gray, window_size=w_size)
-        binarized = gray.copy()
-        binarized[gray > thresh] = 255
-        # Quick noise removal
-        kernel = np.ones((2,2), np.uint8)
-        return cv2.cvtColor(cv2.morphologyEx(binarized, cv2.MORPH_OPEN, kernel), cv2.COLOR_GRAY2BGR)
-
-    for b in results.boxes:
-        if "stamp" in results.names[int(b.cls[0])].lower():
-            box = [int(x) for x in b.xyxy[0].tolist()]
-            x1, y1, x2, y2 = intersect(box, w, h)
-            if x2 > x1 and y2 > y1:
-                roi = processed_img[y1:y2, x1:x2]
-                processed_img[y1:y2, x1:x2] = clean_crop(roi)
-    return processed_img
-
 def run_pipeline(config: PipelineConfig):
     os.makedirs(os.path.dirname(config.output_pdf_path), exist_ok=True)
     doc_model, stamp_model = load_models(config)
@@ -234,10 +191,13 @@ def run_pipeline(config: PipelineConfig):
     total = doc.page_count
     
     print(f"\nProcessing: {config.input_pdf_path}")
-    print("Applying Fixes: Dark Ink Check (Blank Pages) & Contour Check (Text-as-Image)")
+    print("Mode: Grayscale Text | Color Images | Ghost Image Fix | Tracking Output Page Indices")
 
-    kept = 0
+    # This counter tracks the page number in the NEW (Output) PDF
+    current_output_page_idx = 0 
+    
     removed = 0
+    pages_with_stamps_output_idx = []
 
     for i in range(total):
         sys.stdout.write(f"\rPage {i+1}/{total}...")
@@ -246,34 +206,51 @@ def run_pipeline(config: PipelineConfig):
             original_bgr = get_pdf_page_as_bgr(config.input_pdf_path, i+1, config.dpi)
             h, w = original_bgr.shape[:2]
             
-            # 1. Analyze
-            is_blank, image_boxes = get_page_analysis(original_bgr, doc_model, config)
+            # 1. Analyze (Detects Blank & Identifies Real Images)
+            is_blank, real_image_boxes = get_page_analysis(original_bgr, doc_model, config)
             
             if is_blank:
                 removed += 1
-                continue # Skip Page
+                continue # Skip Page (Does NOT increment output page counter)
             
-            kept += 1
+            # If we are here, we are KEEPING this page.
+            # Increment the output page counter.
+            current_output_page_idx += 1
             
-            # 2. Clean Stamps
-            cleaned_bgr = process_stamps(original_bgr, stamp_model, config)
+            # 2. Check for Stamps (Log the CURRENT OUTPUT INDEX)
+            try:
+                stamp_results = stamp_model.predict(original_bgr, conf=config.conf_stamp, imgsz=640, verbose=False)[0]
+                has_stamp = False
+                for b in stamp_results.boxes:
+                    if "stamp" in stamp_results.names[int(b.cls[0])].lower():
+                        has_stamp = True
+                        break
+                
+                if has_stamp:
+                    # Log the index in the OUTPUT PDF (1-based)
+                    pages_with_stamps_output_idx.append(current_output_page_idx)
+            except Exception:
+                pass
             
-            # 3. Extract Real Images (Color Preservation)
+            # 3. Use Original Image for Base
+            cleaned_bgr = original_bgr.copy()
+            
+            # 4. Extract Real Images (Preserve Color)
             preserved_regions = []
-            for box in image_boxes:
+            for box in real_image_boxes:
                 x1, y1, x2, y2 = intersect(box, w, h)
                 if x2 > x1 and y2 > y1:
                     preserved_regions.append((cleaned_bgr[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)))
 
-            # 4. Convert Everything to Grayscale
+            # 5. Convert Background (Text/Layout) to Grayscale
             gray_layer = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2GRAY)
             final_composite = cv2.cvtColor(gray_layer, cv2.COLOR_GRAY2BGR)
             
-            # 5. Paste Back Color Images
+            # 6. Paste Back Real Color Images
             for img_patch, (x1, y1, x2, y2) in preserved_regions:
                 final_composite[y1:y2, x1:x2] = img_patch
             
-            # 6. Save
+            # 7. Save
             img_pil = Image.fromarray(cv2.cvtColor(final_composite, cv2.COLOR_BGR2RGB))
             import io
             img_byte_arr = io.BytesIO()
@@ -281,17 +258,25 @@ def run_pipeline(config: PipelineConfig):
             pdf_page = out_doc.new_page(width=img_pil.width, height=img_pil.height)
             pdf_page.insert_image(fitz.Rect(0, 0, img_pil.width, img_pil.height), stream=img_byte_arr.getvalue())
             
-        except Exception:
+        except Exception as e:
+            print(f"Error on page {i}: {e}")
             continue
 
     out_doc.save(config.output_pdf_path, deflate=True, garbage=4)
     out_doc.close()
-    print(f"\n\nDone! Kept {kept} pages. Removed {removed} blank/noise pages.")
+    
+    print(f"\n\nProcessing Complete!")
+    print(f"Total Pages in Output PDF: {current_output_page_idx}")
+    print(f"Blank Pages Removed: {removed}")
+    print("-" * 40)
+    print(f"Output PDF Page Numbers containing Stamps ({len(pages_with_stamps_output_idx)} detected):")
+    print(pages_with_stamps_output_idx)
+    print("-" * 40)
 
 if __name__ == "__main__":
     cfg = PipelineConfig(
-        input_pdf_path = r"D:\Cilans\PDF-RESTORATION\experiments\PDF_restoration\pdfs\5_RISHABHDEV EK PARISHILIN (C0851).PDF.pdf",
-        output_pdf_path = r"D:\Cilans\PDF-RESTORATION\experiments\data\PDF_restoration\pdfs\output-19-12_1.pdf",
+        input_pdf_path = r"D:\Cilans\PDF-RESTORATION\experiments\PDF_restoration\pdfs\8_VISHWATMA SHRI ADINATH (C1374)_copy.pdf",
+        output_pdf_path = r"D:\Cilans\PDF-RESTORATION\experiments\data\PDF_restoration\pdfs\output-19-12_2.pdf",
         model_doclayout_path = r"D:\Cilans\PDF-RESTORATION\experiments\doclayout_yolo_docstructbench_imgsz1280_2501.pt",
         model_stamp_path = r"D:\Cilans\PDF-RESTORATION\experiments\finetunedyolo11m_896imgsz_50epochs.pt",
         dpi = 150
