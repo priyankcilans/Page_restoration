@@ -4,7 +4,7 @@ import time
 import argparse
 
 # ==============================================================================
-# 0. CRITICAL ANTI-FREEZE CONFIGURATION (MUST BE FIRST)
+# 0. CRITICAL ANTI-FREEZE CONFIGURATION
 # ==============================================================================
 print("Initializing Environment...")
 
@@ -32,22 +32,11 @@ from PIL import Image
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Tuple, Any, Dict
+from paddleocr import LayoutDetection
+from skimage.filters import threshold_sauvola
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
-
-# Check Imports
-try:
-    from paddleocr import LayoutDetection
-except ImportError:
-    print("CRITICAL ERROR: paddleocr not installed. Run: pip install paddlepaddle paddleocr")
-    sys.exit(1)
-
-try:
-    from skimage.filters import threshold_sauvola
-except ImportError:
-    print("CRITICAL ERROR: scikit-image not installed. Run: pip install scikit-image")
-    sys.exit(1)
 
 # ==============================================================================
 # 1. LOGGING & CONFIGURATION
@@ -58,28 +47,22 @@ def setup_logging():
     Configures a strictly formatted logger. 
     Uses propagate=False to prevent double logging or leakage to root handlers.
     """
-    # 1. Define Format (No filename, no line number)
     log_fmt = '%(asctime)s | %(levelname)s | %(message)s'
     date_fmt = '%Y-%m-%d %H:%M:%S'
     formatter = logging.Formatter(log_fmt, datefmt=date_fmt)
 
-    # 2. Configure Specific Logger
     logger = logging.getLogger("PDFRestoration")
     logger.setLevel(logging.INFO)
     
-    # CRITICAL: Stop logs from bubbling up to the root logger (which has the noisy handler)
     logger.propagate = False 
 
-    # 3. Clean existing handlers
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # 4. Add clean StreamHandler
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     
-    # 5. Silence third-party noise
     logging.getLogger("ppocr").setLevel(logging.ERROR) 
     logging.getLogger("paddle").setLevel(logging.ERROR)
     logging.getLogger("PIL").setLevel(logging.ERROR)
@@ -95,18 +78,14 @@ class PipelineConfig:
     output_pdf_path: str
     model_paddle_dir: str
     
-    # Output Directories
     temp_dir: str = "pipeline_temp"
     
-    # PDF Settings
     dpi: int = 200        
     upscale_factor: float = 1.0 
     jpg_quality: int = 100    
     
-    # Detection Settings 
     conf_threshold: float = 0.20
     
-    # Logic Parameters
     denoise_h: float = 10.0 
     sauvola_window_normal: int = 40  
     max_dot_area: int = 2
@@ -284,7 +263,6 @@ class PDFRestorationPipeline:
         """Parses the result from LayoutDetection safely."""
         parsed_items = []
         
-        # 1. Try Object Attributes (Standard Wrapper)
         if hasattr(result, 'boxes') and hasattr(result, 'scores') and hasattr(result, 'label_ids'):
             boxes = getattr(result, 'boxes', None)
             scores = getattr(result, 'scores', None)
@@ -299,7 +277,6 @@ class PDFRestorationPipeline:
                         continue
                 return parsed_items
 
-        # 2. Try Dictionary Keys
         if isinstance(result, dict):
             # Case A: Separate keys exist
             if 'boxes' in result and 'scores' in result and 'label_ids' in result:
@@ -317,11 +294,9 @@ class PDFRestorationPipeline:
                     return parsed_items
             
             # Case B: Nested List of Dictionaries (Your Specific JSON Format)
-            # { "boxes": [ {"cls_id": 1, "coordinate": [...], "score": ...}, ... ] }
             if 'boxes' in result:
                 boxes_data = result['boxes']
                 if isinstance(boxes_data, list) and len(boxes_data) > 0:
-                    # Check if the contents are dicts
                     if isinstance(boxes_data[0], dict):
                         for item in boxes_data:
                             box = item.get('coordinate') or item.get('bbox')
@@ -376,7 +351,6 @@ class PDFRestorationPipeline:
                         logger.info(f"Page {page_num}: No layout elements detected.")
 
                     for box, score, lid in items:
-                        # DEBUG: Log all detections for transparency
                         if score < self.cfg.conf_threshold: 
                             continue
                         
@@ -396,7 +370,6 @@ class PDFRestorationPipeline:
             gray = cv2.cvtColor(page_bgr, cv2.COLOR_BGR2GRAY)
             approach, m = self.engine.classify_page(gray)
             
-            # LOG: Process Metrics
             logger.info(f"Page {page_num}: Process: {approach.upper()} | Metrics: "
                         f"Contrast={m['Contrast']:.1f}, Mean={m['Mean']:.1f}, "
                         f"vDark={m['vDark']:.2f}%, Lap={m['Lap']:.1f}")
