@@ -4,7 +4,7 @@ import time
 import argparse
 
 # ==============================================================================
-# 0. CRITICAL ANTI-FREEZE CONFIGURATION (MUST BE FIRST)
+# 0. CRITICAL ANTI-FREEZE CONFIGURATION
 # ==============================================================================
 print("Initializing Environment...")
 
@@ -32,22 +32,11 @@ from PIL import Image
 import datetime
 from dataclasses import dataclass
 from typing import List, Tuple, Any, Dict
+from paddleocr import LayoutDetection
+from skimage.filters import threshold_sauvola
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
-
-# Check Imports
-try:
-    from paddleocr import LayoutDetection
-except ImportError:
-    print("CRITICAL ERROR: paddleocr not installed. Run: pip install paddlepaddle paddleocr")
-    sys.exit(1)
-
-try:
-    from skimage.filters import threshold_sauvola
-except ImportError:
-    print("CRITICAL ERROR: scikit-image not installed. Run: pip install scikit-image")
-    sys.exit(1)
 
 # ==============================================================================
 # 1. LOGGING & CONFIGURATION
@@ -58,28 +47,22 @@ def setup_logging():
     Configures a strictly formatted logger. 
     Uses propagate=False to prevent double logging or leakage to root handlers.
     """
-    # 1. Define Format (No filename, no line number)
     log_fmt = '%(asctime)s | %(levelname)s | %(message)s'
     date_fmt = '%Y-%m-%d %H:%M:%S'
     formatter = logging.Formatter(log_fmt, datefmt=date_fmt)
 
-    # 2. Configure Specific Logger
     logger = logging.getLogger("PDFRestoration")
     logger.setLevel(logging.INFO)
     
-    # CRITICAL: Stop logs from bubbling up to the root logger (which has the noisy handler)
     logger.propagate = False 
 
-    # 3. Clean existing handlers
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # 4. Add clean StreamHandler
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     
-    # 5. Silence third-party noise
     logging.getLogger("ppocr").setLevel(logging.ERROR) 
     logging.getLogger("paddle").setLevel(logging.ERROR)
     logging.getLogger("PIL").setLevel(logging.ERROR)
@@ -190,7 +173,7 @@ class ImageUtils:
         return False
 
 # ==============================================================================
-# CLEANING ENGINE (SIMPLIFIED FOR GRAYSCALE)
+# CLEANING ENGINE
 # ==============================================================================
 
 class EnhancementEngine:
@@ -205,8 +188,7 @@ class EnhancementEngine:
         # 1. Convert to Gray
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         
-        # 2. Mild Denoising (Optional: keeps text sharp but removes some grain)
-        # Using a low 'h' value preserves faint text while removing digital noise
+        # 2. Mild Denoising
         denoised = cv2.fastNlMeansDenoising(gray, None, h=3, templateWindowSize=7, searchWindowSize=21)
         
         return denoised
@@ -350,7 +332,6 @@ class PDFRestorationPipeline:
                     logger.error(f"Detection failed on page {page_num}: {e}")
 
                 # --- GRAYSCALE CONVERSION (NO CLASSIFICATION/BINARIZATION) ---
-                # This replaces the complex engine calls with simple grayscale
                 cleaned_gray = self.engine.convert_to_grayscale(original_bgr)
                 final_composite = cv2.cvtColor(cleaned_gray, cv2.COLOR_GRAY2BGR)
 
@@ -423,4 +404,8 @@ if __name__ == "__main__":
         print("FATAL PIPELINE CRASH")
         print("="*50)
         traceback.print_exc()
+
         print("="*50)
+
+    # Example Usage:
+    # python combine-approach-v2.py --input "data/input.pdf" --output "data/output.pdf"
