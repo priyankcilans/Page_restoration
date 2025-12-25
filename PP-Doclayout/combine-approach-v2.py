@@ -515,4 +515,8 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("="*50)
         
+
     print("\nProcess finished.")
+
+    # Example Usage:
+    # python combine-approach-v2.py --input "data/input.pdf" --output "data/output.pdf"
